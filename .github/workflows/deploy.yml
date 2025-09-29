@@ -1,0 +1,54 @@
+name: Deploy to Yandex Cloud Functions
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    env:
+      YC_SERVICE_ACCOUNT_KEY: ${{ secrets.YC_SERVICE_ACCOUNT_KEY }}
+      YC_FOLDER_ID: ${{ secrets.YC_FOLDER_ID }}
+      YC_FUNCTION_ID: ${{ secrets.YC_FUNCTION_ID }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Yandex Cloud CLI
+        uses: yc-actions/yc-cli@v1
+
+      - name: Configure Yandex Cloud CLI
+        run: |
+          echo "$YC_SERVICE_ACCOUNT_KEY" > sa-key.json
+          yc config set service-account-key sa-key.json
+          yc config set folder-id "$YC_FOLDER_ID"
+
+      - name: Prepare function bundle
+        run: |
+          rm -rf build
+          mkdir -p build
+          cp -r src build/
+          cp requirements.txt build/
+          cd build
+          zip -r ../function.zip .
+
+      - name: Deploy function
+        run: |
+          yc serverless function version create \
+            --id "$YC_FUNCTION_ID" \
+            --runtime python311 \
+            --entrypoint main.handler \
+            --memory 256m \
+            --execution-timeout 10s \
+            --source-path function.zip \
+            --environment "TELEGRAM_TOKEN=${{ secrets.TELEGRAM_TOKEN }}" "TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}"
