@@ -1,58 +1,122 @@
 """Entry point for Yandex Cloud Functions."""
 from __future__ import annotations
 
-from typing import Any, Dict, List
+import json
 import logging
+from typing import Any, Dict, Iterable, List, Sequence
 
 import requests
 
-from . import config
-from .hltv_api import HLTVApiError, fetch_recent_results, format_match
+from .config import CHANNELS, TELEGRAM_TOKEN
+from .hltv_api import HLTVApiError, MatchResult, fetch_recent_results as fetch_results
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
+
+TELEGRAM_API_URL = "https://api.telegram.org"
+TELEGRAM_METHOD = "sendMessage"
+MIN_MATCHES = 1
+MAX_MATCHES = 3
 
 
-def _send_to_telegram(channel: config.TelegramChannel, text: str) -> None:
-    url = f"https://api.telegram.org/bot{channel.bot_token}/sendMessage"
-    payload = {"chat_id": channel.chat_id, "text": text}
-    response = requests.post(url, json=payload, timeout=10)
+def send_to_telegram(chat_id: str, text: str, timeout: int = 7) -> Dict[str, Any]:
+    """Send ``text`` to ``chat_id`` via Telegram Bot API."""
+
+    if not TELEGRAM_TOKEN:
+        raise RuntimeError("TELEGRAM_TOKEN is not configured")
+
+    url = f"{TELEGRAM_API_URL}/bot{TELEGRAM_TOKEN}/{TELEGRAM_METHOD}"
+    payload = {"chat_id": chat_id, "text": text}
+    response = requests.post(url, json=payload, timeout=timeout)
     response.raise_for_status()
+    return response.json()
 
 
-def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
-    """Yandex Cloud Functions handler."""
+def _get_attr(obj: Any, key: str, default: str = "") -> str:
+    if hasattr(obj, key):  # dataclass MatchResult
+        value = getattr(obj, key)
+        if value is not None:
+            return str(value)
+    if isinstance(obj, dict):
+        value = obj.get(key)
+        if value is not None:
+            return str(value)
+    return default
 
-    channel_count = len(config.CHANNELS)
-    if channel_count == 0:
-        logger.warning("No Telegram channels configured.")
-        return {"status": "no_channels"}
-    if channel_count > config.MAX_CHANNELS:
-        logger.error("Too many channels configured (max %s)", config.MAX_CHANNELS)
-        return {"status": "too_many_channels"}
 
-    requested_limit = None
+def format_match(match: MatchResult) -> str:
+    """Convert a match result into a multi-line Telegram message."""
+
+    team1 = _get_attr(match, "team1", "Team 1")
+    team2 = _get_attr(match, "team2", "Team 2")
+    map_score = _get_attr(match, "map_score")
+    event = _get_attr(match, "event")
+    time = _get_attr(match, "time")
+    match_id = _get_attr(match, "match_id")
+
+    pieces: List[str] = [f"{team1} vs {team2}"]
+    if map_score:
+        pieces.append(f"Score: {map_score}")
+    if event:
+        pieces.append(f"Event: {event}")
+    if time:
+        pieces.append(f"Time: {time}")
+    if match_id:
+        pieces.append(f"Match ID: {match_id}")
+    return "\n".join(pieces)
+
+
+def _match_matches_channel(match: MatchResult, teams: Sequence[str] | None) -> bool:
+    if not teams:
+        return True
+    team1 = _get_attr(match, "team1").lower()
+    team2 = _get_attr(match, "team2").lower()
+    match_teams = {team1, team2}
+    for team in teams:
+        if team and team.lower() in match_teams:
+            return True
+    return False
+
+
+def _iter_channels() -> Iterable[Dict[str, Any]]:
+    for channel in CHANNELS:
+        chat_id = channel.get("chat_id")
+        if not chat_id:
+            logger.warning("Skipping channel without chat_id: %s", channel)
+            continue
+        yield channel
+
+
+def handler(event: Dict[str, Any] | None, context: Any) -> Dict[str, Any]:
+    """Yandex Cloud Functions entry point."""
+
+    limit = MAX_MATCHES
     if isinstance(event, dict):
-        requested_limit = event.get("limit")
-    max_matches = config.DEFAULT_MATCHES_PER_CHANNEL
-    if isinstance(requested_limit, int) and 1 <= requested_limit <= 3:
-        max_matches = requested_limit
+        requested = event.get("limit")
+        if isinstance(requested, int):
+            limit = max(MIN_MATCHES, min(MAX_MATCHES, requested))
 
     try:
-        results = fetch_recent_results(limit=max_matches)
-    except HLTVApiError:
-        return {"status": "hltv_error"}
+        matches = fetch_results(limit=limit)
+    except HLTVApiError as exc:
+        logger.error("Failed to fetch results: %s", exc)
+        return {"statusCode": 502, "body": json.dumps({"error": str(exc)})}
 
-    dispatched: List[str] = []
-    for channel in config.CHANNELS:
-        limit = min(channel.max_matches, len(results))
-        for match in results[:limit]:
+    channel_stats: Dict[str, int] = {}
+    sent_messages = 0
+    for channel in _iter_channels():
+        name = channel.get("name", "unknown")
+        teams = channel.get("teams")
+        filtered_matches = [m for m in matches if _match_matches_channel(m, teams)]
+        channel_stats[name] = len(filtered_matches)
+        for match in filtered_matches:
             text = format_match(match)
-            try:
-                _send_to_telegram(channel, text)
-            except requests.RequestException as exc:  # pragma: no cover
-                logger.error("Failed to send message to %s: %s", channel.name, exc)
-                continue
-        dispatched.append(channel.name)
+            send_to_telegram(channel["chat_id"], text)
+            sent_messages += 1
 
-    return {"status": "ok", "channels": dispatched, "matches": len(results)}
+    body = {
+        "requested_limit": limit,
+        "matches_received": len(matches),
+        "messages_sent": sent_messages,
+        "per_channel": channel_stats,
+    }
+    return {"statusCode": 200, "body": json.dumps(body)}
